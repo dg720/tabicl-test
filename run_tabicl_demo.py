@@ -1,11 +1,13 @@
 import os
 import time
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from sklearn.calibration import calibration_curve
 from sklearn.datasets import load_breast_cancer
 from sklearn.metrics import accuracy_score, brier_score_loss
@@ -68,6 +70,204 @@ def compute_ece_from_calibration_curve(
         j += 1
 
     return float(ece)
+
+
+def compute_attention_weights(
+    module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_padding_mask: torch.Tensor | None = None,
+    attn_mask: torch.Tensor | int | None = None,
+    rope=None,
+) -> torch.Tensor | None:
+    if isinstance(attn_mask, int):
+        return None
+
+    *batch_shape, tgt_len, embed_dim = query.shape
+    src_len = key.shape[-2]
+    num_heads = module.num_heads
+    head_dim = embed_dim // num_heads
+
+    q, k, _ = F._in_projection_packed(
+        query, key, value, module.in_proj_weight, module.in_proj_bias
+    )
+    q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)
+    k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)
+
+    if rope is not None:
+        q = rope.rotate_queries_or_keys(q)
+        k = rope.rotate_queries_or_keys(k)
+
+    q = q.float()
+    k = k.float()
+    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(head_dim)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            mask = attn_mask
+            if mask.dim() == 2:
+                view_shape = (1,) * len(batch_shape) + (1, tgt_len, src_len)
+                mask = mask.view(*view_shape)
+            scores = scores.masked_fill(mask, float("-inf"))
+        else:
+            additive = attn_mask.to(scores.dtype)
+            if additive.dim() == 2:
+                view_shape = (1,) * len(batch_shape) + (1, tgt_len, src_len)
+                additive = additive.view(*view_shape)
+            scores = scores + additive
+
+    if key_padding_mask is not None:
+        if key_padding_mask.dtype == torch.bool:
+            mask = (
+                key_padding_mask.view(*batch_shape, 1, 1, src_len)
+                .expand(*batch_shape, num_heads, tgt_len, src_len)
+            )
+            scores = scores.masked_fill(mask, float("-inf"))
+        else:
+            additive = (
+                key_padding_mask.to(scores.dtype)
+                .view(*batch_shape, 1, 1, src_len)
+                .expand(*batch_shape, num_heads, tgt_len, src_len)
+            )
+            scores = scores + additive
+
+    return torch.softmax(scores, dim=-1)
+
+
+def extract_feature_attention_matrix(
+    x_train: pd.DataFrame, y_train: pd.Series, x_test: pd.DataFrame
+) -> tuple[np.ndarray, list[str], list[tuple[str, float]]]:
+    from tabicl import TabICLClassifier
+
+    feature_names = list(x_train.columns)
+    n_features = len(feature_names)
+
+    devices_to_try: list[str | None]
+    if torch.cuda.is_available():
+        devices_to_try = [None, "cpu"]
+    else:
+        devices_to_try = [None]
+
+    last_exc: Exception | None = None
+    for device in devices_to_try:
+        try:
+            attn_clf = TabICLClassifier(
+                n_estimators=1,
+                feat_shuffle_method="none",
+                class_shift=False,
+                batch_size=1,
+                random_state=42,
+                device=device,
+            )
+            attn_clf.fit(x_train, y_train)
+
+            row_block = attn_clf.model_.row_interactor.tf_row.blocks[-1]
+            row_attn = row_block.attn
+            num_cls = attn_clf.model_.row_interactor.num_cls
+            captured_weights: list[torch.Tensor] = []
+            original_forward = row_attn.forward
+
+            def wrapped_forward(
+                query, key, value, key_padding_mask=None, attn_mask=None, rope=None
+            ):
+                out = original_forward(
+                    query,
+                    key,
+                    value,
+                    key_padding_mask=key_padding_mask,
+                    attn_mask=attn_mask,
+                    rope=rope,
+                )
+                with torch.no_grad():
+                    weights = compute_attention_weights(
+                        module=row_attn,
+                        query=query,
+                        key=key,
+                        value=value,
+                        key_padding_mask=key_padding_mask,
+                        attn_mask=attn_mask,
+                        rope=rope,
+                    )
+                    if weights is not None:
+                        captured_weights.append(weights.detach().cpu())
+                return out
+
+            row_attn.forward = wrapped_forward
+            try:
+                _ = attn_clf.predict_proba(x_test)
+            finally:
+                row_attn.forward = original_forward
+
+            if not captured_weights:
+                raise RuntimeError("Attention instrumentation captured no weights.")
+
+            weights_all = torch.cat(captured_weights, dim=0)
+            train_size = len(y_train)
+            if weights_all.shape[1] > train_size:
+                weights_rows = weights_all[:, train_size:, ...]
+            else:
+                weights_rows = weights_all
+
+            feat_start = num_cls
+            feat_end = num_cls + n_features
+            cls_to_feat = weights_rows[..., :num_cls, feat_start:feat_end]
+
+            matrix = cls_to_feat.mean(dim=(0, 1, 2)).numpy()  # (num_cls, n_features)
+            row_sums = matrix.sum(axis=1, keepdims=True)
+            matrix_norm = np.divide(
+                matrix,
+                row_sums,
+                out=np.zeros_like(matrix),
+                where=row_sums > 0,
+            )
+
+            avg_row = matrix_norm.mean(axis=0, keepdims=True)
+            heatmap_matrix = np.vstack([matrix_norm, avg_row])
+            row_labels = [f"CLS_{i}" for i in range(num_cls)] + ["CLS_avg"]
+
+            top_idx = np.argsort(avg_row[0])[::-1][:10]
+            top_features = [
+                (feature_names[idx], float(avg_row[0, idx])) for idx in top_idx
+            ]
+            return heatmap_matrix, row_labels, top_features
+        except Exception as exc:  # noqa: BLE001
+            if is_cuda_oom(exc) and device is None and torch.cuda.is_available():
+                print("CUDA OOM during attention extraction. Retrying on CPU.")
+                torch.cuda.empty_cache()
+                continue
+            last_exc = exc
+            break
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Attention extraction failed unexpectedly.")
+
+
+def save_attention_heatmap(
+    heatmap_matrix: np.ndarray, row_labels: list[str], feature_names: list[str]
+) -> None:
+    fig_width = max(12, 0.35 * len(feature_names))
+    fig_height = 2.5 + 0.55 * len(row_labels)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    im = ax.imshow(heatmap_matrix, cmap="magma", aspect="auto")
+    ax.set_xticks(np.arange(len(feature_names)))
+    ax.set_xticklabels(feature_names, rotation=70, ha="right", fontsize=8)
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_yticklabels(row_labels, fontsize=9)
+    ax.set_xlabel("Input features")
+    ax.set_ylabel("Row transformer CLS queries")
+    ax.set_title("TabICL Attention Heatmap (CLS -> Features, last row-attention block)")
+    fig.colorbar(
+        im,
+        ax=ax,
+        fraction=0.046,
+        pad=0.04,
+        label="Normalized attention mass over feature keys",
+    )
+    fig.tight_layout()
+    fig.savefig("attention_heatmap.png", dpi=220)
+    plt.close(fig)
 
 
 def fit_predict_with_retry(
@@ -230,6 +430,29 @@ def main() -> int:
     plt.tight_layout()
     plt.savefig("bin_stats_table.png", dpi=200)
     plt.close(fig)
+
+    try:
+        feature_names = list(x_train.columns)
+        attn_matrix, attn_row_labels, top_features = extract_feature_attention_matrix(
+            x_train=x_train,
+            y_train=y_train,
+            x_test=x_test,
+        )
+        save_attention_heatmap(
+            heatmap_matrix=attn_matrix,
+            row_labels=attn_row_labels,
+            feature_names=feature_names,
+        )
+        print("\nTop 10 features by CLS_avg attention:")
+        for name, score in top_features:
+            print(f"  {name:>24s}  {score:.6f}")
+        print("Saved attention heatmap to: attention_heatmap.png")
+    except Exception as exc:  # noqa: BLE001
+        if is_hf_download_error(exc):
+            print(
+                "Checkpoint download failed; please pre-download on a login node or set HF cache."
+            )
+        print(f"Attention extraction skipped due to error: {exc}")
 
     print("Saved reliability diagram to: reliability.png")
     print("Saved bin table visualization to: bin_stats_table.png")

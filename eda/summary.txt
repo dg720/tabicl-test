@@ -1,0 +1,35 @@
+TabICL EDA + Interpretability Summary
+Rows total: 569, train: 455, test: 114
+Accuracy: 0.964912
+Brier score: 0.024117
+Fit seconds: 0.657
+Predict seconds: 0.902
+
+How to interpret outputs:
+- permutation_importance.csv: global feature influence by performance drop after shuffling each feature.
+- local_perturbation_effects.csv: local sensitivity; each feature is replaced with train median and probability shift is measured.
+- local_effects_heatmap.png: positive delta means feature median-replacement increases P(y=1) for that sample.
+
+Top global features (delta_brier):
+- area error: 0.032242
+- worst area: 0.029202
+- worst radius: 0.022500
+- mean concave points: 0.016048
+- mean compactness: 0.013850
+- worst concave points: 0.012784
+- worst perimeter: 0.012372
+- worst smoothness: 0.011727
+- worst concavity: 0.009791
+- compactness error: 0.008673
+
+Top local sensitivity features (mean abs delta_prob_1):
+- worst area: 0.132442
+- worst radius: 0.086817
+- area error: 0.080314
+- mean concave points: 0.055614
+- worst fractal dimension: 0.044904
+- worst symmetry: 0.041656
+- mean radius: 0.040226
+- mean fractal dimension: 0.037580
+- mean symmetry: 0.036912
+- worst concavity: 0.036405
